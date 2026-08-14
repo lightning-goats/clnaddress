@@ -1,17 +1,15 @@
+use anyhow::Context;
 use axum::{Router, routing::get};
 use bech32::{Bech32, Hrp};
 use cln_plugin::{
     RpcMethodBuilder,
     options::{
-        ConfigOption,
-        DefaultIntegerConfigOption,
-        DefaultStringConfigOption,
-        StringConfigOption,
+        ConfigOption, DefaultIntegerConfigOption, DefaultStringConfigOption, StringConfigOption,
     },
 };
 use parse::get_startup_options;
 use rpc::{user_add, user_del};
-use structs::PluginState;
+use structs::{PluginState, validate_user};
 use tokio::{
     fs,
     io::{stdin, stdout},
@@ -56,7 +54,11 @@ const OPT_CLNADDRESS_BASE_URL: StringConfigOption = ConfigOption::new_str_no_def
 );
 const OPT_CLNADDRESS_NOSTR_PRIVKEY: StringConfigOption = ConfigOption::new_str_no_default(
     "clnaddress-nostr-privkey",
-    "Nostr private key for zap receipts",
+    "Nostr private key for zap receipts (prefer clnaddress-nostr-privkey-file in production)",
+);
+const OPT_CLNADDRESS_NOSTR_PRIVKEY_FILE: StringConfigOption = ConfigOption::new_str_no_default(
+    "clnaddress-nostr-privkey-file",
+    "Path to a mode-0600-or-stricter file containing the Nostr private key for zap receipts",
 );
 const CLNADDRESS_USERS_FILENAME: &str = "users.json";
 const CLNADDRESS_PAYINDEX_FILENAME: &str = "payindex.json";
@@ -76,10 +78,13 @@ async fn main() -> anyhow::Result<()> {
         .option(OPT_CLNADDRESS_MAX_RECEIVABLE)
         .option(OPT_CLNADDRESS_DESCRIPTION)
         .option(OPT_CLNADDRESS_NOSTR_PRIVKEY)
+        .option(OPT_CLNADDRESS_NOSTR_PRIVKEY_FILE)
         .rpcmethod_from_builder(
             RpcMethodBuilder::new("clnaddress-adduser", user_add)
-                .description("Add a user with optional metadata to create a ln address")
-                .usage("user [is_email] [description]"),
+                .description("Add or update a user with optional LNURL metadata and policy")
+                .usage(
+                    "user [is_email] [description] [min_sendable_msat] [max_sendable_msat] [comment_allowed] [nostr_enabled]",
+                ),
         )
         .rpcmethod_from_builder(
             RpcMethodBuilder::new("clnaddress-deluser", user_del)
@@ -185,7 +190,18 @@ async fn read_plugin_config_files(state: &mut PluginState) -> Result<(), anyhow:
         },
     }
     match fs::read_to_string(state.plugin_dir.join(CLNADDRESS_USERS_FILENAME)).await {
-        Ok(content) => *state.users.lock() = serde_json::from_str(&content)?,
+        Ok(content) => {
+            let users: std::collections::HashMap<String, structs::UserMetadata> =
+                serde_json::from_str(&content)?;
+            for (user, metadata) in &users {
+                validate_user(user)
+                    .with_context(|| format!("invalid persisted clnaddress user `{user}`"))?;
+                metadata
+                    .validate(state.min_sendable_msat, state.max_sendable_msat)
+                    .with_context(|| format!("invalid persisted settings for clnaddress user `{user}`"))?;
+            }
+            *state.users.lock() = users;
+        }
         Err(e) => match e.kind() {
             std::io::ErrorKind::NotFound => (),
             _ => log::warn!("Could not read {CLNADDRESS_USERS_FILENAME} file: {e}"),
