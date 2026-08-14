@@ -161,4 +161,53 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_group_or_world_readable_zap_secret_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "clnaddress-insecure-zap-key-{}",
+            std::process::id()
+        ));
+        fs::write(&path, "test-secret").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(read_secret_file(&path).is_err());
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_private_regular_zap_secret_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!(
+            "clnaddress-private-zap-key-{}",
+            std::process::id()
+        ));
+        fs::write(&path, "test-secret\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(read_secret_file(&path).unwrap(), "test-secret\n");
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_zap_secret_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp_dir = std::env::temp_dir();
+        let target = temp_dir.join(format!("clnaddress-zap-target-{}", std::process::id()));
+        let link = temp_dir.join(format!("clnaddress-zap-link-{}", std::process::id()));
+        fs::write(&target, "test-secret").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        assert!(read_secret_file(&link).is_err());
+        let _ = fs::remove_file(link);
+        let _ = fs::remove_file(target);
+    }
 }
