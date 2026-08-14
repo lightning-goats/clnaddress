@@ -16,6 +16,7 @@ pub struct PluginState {
     pub min_sendable_msat: u64,
     pub default_description: String,
     pub users: Arc<Mutex<HashMap<String, UserMetadata>>>,
+    pub user_update_lock: Arc<tokio::sync::Mutex<()>>,
     pub plugin_dir: PathBuf,
     pub base_url: Url,
     pub nostr_zapper_keys: Option<nostr::key::Keys>,
@@ -101,11 +102,11 @@ pub fn validate_user(user: &str) -> Result<()> {
     if !user
         .as_bytes()
         .first()
-        .is_some_and(u8::is_ascii_alphanumeric)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
         || !user
             .as_bytes()
             .last()
-            .is_some_and(u8::is_ascii_alphanumeric)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
     {
         bail!("user must start and end with an ASCII letter or digit");
     }
