@@ -85,6 +85,7 @@ pub fn get_startup_options(
         min_sendable_msat,
         default_description,
         users: Arc::new(Mutex::new(HashMap::new())),
+        user_update_lock: Arc::new(tokio::sync::Mutex::new(())),
         plugin_dir,
         base_url,
         nostr_zapper_keys,
