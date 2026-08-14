@@ -95,19 +95,16 @@ jobs:
             echo "Expected minimum macOS version: $EXPECTED_TARGET"
             echo
 
-            # Check x86_64 slice
             X86_MINOS=$(otool -l -arch x86_64 "$BINARY" | awk '
               /LC_BUILD_VERSION/ || /LC_VERSION_MIN_MACOSX/ {getline; getline; getline; if ($1 == "minos") print $2}
             ')
             echo "x86_64 slice minos: $X86_MINOS"
 
-            # Check arm64 slice
             ARM64_MINOS=$(otool -l -arch arm64 "$BINARY" | awk '
               /LC_BUILD_VERSION/ || /LC_VERSION_MIN_MACOSX/ {getline; getline; getline; if ($1 == "minos") print $2}
             ')
             echo "arm64 slice minos: $ARM64_MINOS"
 
-            # Fail if either doesn't match
             if [ "$X86_MINOS" != "$EXPECTED_TARGET" ] || [ "$ARM64_MINOS" != "$EXPECTED_TARGET" ]; then
               echo "ERROR: Deployment target mismatch!"
               echo "Expected: $EXPECTED_TARGET"
@@ -147,11 +144,20 @@ jobs:
               uses: actions/download-artifact@v8
               with:
                 merge-multiple: true
+            - name: Generate SHA-256 checksums
+              shell: bash
+              run: |
+                set -euo pipefail
+                sha256sum \
+                  ${{ github.event.repository.name }}-${{ github.ref_name }}-*.tar.gz \
+                  ${{ github.event.repository.name }}-${{ github.ref_name }}-*.zip \
+                  > SHA256SUMS
+                cat SHA256SUMS
             - name: Release
               uses: ncipollo/release-action@v1
               with:
                 allowUpdates: false
                 artifactErrorsFailBuild: true
-                body: "${{ steps.changelog_reader.outputs.changes }} \n\n### Release binaries info\n\n- Release binaries were built using rust ${{ needs.build-linux.outputs.rust-version }}\n- Linux release binaries require glibc>=${{ needs.build-linux.outputs.glibc-version }} (check yours with ``ldd --version``)\n- macOS universal binary (x86_64 + aarch64), requires macOS >= ${{ needs.build-macos.outputs.macos-deployment-target }} (deployment target)"
-                artifacts: "${{ github.event.repository.name }}-${{github.ref_name}}-*.tar.gz,${{ github.event.repository.name }}-${{github.ref_name}}-*.zip"
+                body: "${{ steps.changelog_reader.outputs.changes }} \n\n### Release binaries info\n\n- Release binaries were built using rust ${{ needs.build-linux.outputs.rust-version }}\n- Linux release binaries require glibc>=${{ needs.build-linux.outputs.glibc-version }} (check yours with ``ldd --version``)\n- macOS universal binary (x86_64 + aarch64), requires macOS >= ${{ needs.build-macos.outputs.macos-deployment-target }} (deployment target)\n- Verify downloaded archives against the attached ``SHA256SUMS`` file."
+                artifacts: "${{ github.event.repository.name }}-${{github.ref_name}}-*.tar.gz,${{ github.event.repository.name }}-${{github.ref_name}}-*.zip,SHA256SUMS"
                 immutableCreate: true
