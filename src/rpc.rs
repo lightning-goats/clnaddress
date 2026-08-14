@@ -277,7 +277,10 @@ pub async fn save_users(
     users: HashMap<String, UserMetadata>,
 ) -> Result<(), anyhow::Error> {
     let serialized = serde_json::to_string(&users)?;
-    fs::write(path.join(CLNADDRESS_USERS_FILENAME), serialized).await?;
+    let destination = path.join(CLNADDRESS_USERS_FILENAME);
+    let temporary = path.join(format!(".{CLNADDRESS_USERS_FILENAME}.tmp"));
+    fs::write(&temporary, serialized).await?;
+    fs::rename(&temporary, &destination).await?;
     Ok(())
 }
 
