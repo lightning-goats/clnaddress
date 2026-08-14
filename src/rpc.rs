@@ -30,15 +30,19 @@ pub async fn user_add(
         plugin.state().max_sendable_msat,
     )?;
 
-    let result;
-    let users_clone;
-    {
-        let mut users = plugin.state().users.lock();
-        result = users.insert(user.clone(), metadata.clone());
-        users_clone = users.clone();
-    }
-    save_users(&plugin.state().plugin_dir, users_clone).await?;
-    let mut mode = if result.is_some() {
+    let _update_guard = plugin.state().user_update_lock.lock().await;
+    let (existed, updated_users) = {
+        let users = plugin.state().users.lock();
+        let existed = users.contains_key(&user);
+        let mut updated_users = users.clone();
+        updated_users.insert(user.clone(), metadata.clone());
+        (existed, updated_users)
+    };
+
+    save_users(&plugin.state().plugin_dir, updated_users.clone()).await?;
+    *plugin.state().users.lock() = updated_users;
+
+    let mut mode = if existed {
         json!({"mode":"updated"})
     } else {
         json!({"mode":"added"})
@@ -181,28 +185,31 @@ pub async fn user_del(
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
     let user = parse_required_user_selector(args)?;
-    let result;
-    let users_clone;
-    {
-        let mut users = plugin.state().users.lock();
-        result = users.remove(&user);
-        users_clone = users.clone();
-    }
-    if let Some(res) = result {
-        save_users(&plugin.state().plugin_dir, users_clone).await?;
-        let mut mode = json!({"mode":"deleted"});
+    let _update_guard = plugin.state().user_update_lock.lock().await;
 
-        mode.as_object_mut()
-            .unwrap()
-            .extend(json!({"user":user}).as_object().unwrap().clone());
-        mode.as_object_mut()
-            .unwrap()
-            .extend(json!(res).as_object().unwrap().clone());
+    let (removed, updated_users) = {
+        let users = plugin.state().users.lock();
+        let removed = users
+            .get(&user)
+            .cloned()
+            .ok_or_else(|| anyhow!("User not found"))?;
+        let mut updated_users = users.clone();
+        updated_users.remove(&user);
+        (removed, updated_users)
+    };
 
-        Ok(mode)
-    } else {
-        Err(anyhow!("User not found"))
-    }
+    save_users(&plugin.state().plugin_dir, updated_users.clone()).await?;
+    *plugin.state().users.lock() = updated_users;
+
+    let mut mode = json!({"mode":"deleted"});
+    mode.as_object_mut()
+        .unwrap()
+        .extend(json!({"user":user}).as_object().unwrap().clone());
+    mode.as_object_mut()
+        .unwrap()
+        .extend(json!(removed).as_object().unwrap().clone());
+
+    Ok(mode)
 }
 
 pub async fn user_list(
