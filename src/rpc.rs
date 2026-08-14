@@ -1,28 +1,48 @@
 use std::{collections::HashMap, path::Path};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use cln_plugin::Plugin;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use tokio::fs;
 
-use crate::{structs::UserMetadata, PluginState, CLNADDRESS_USERS_FILENAME};
+use crate::{
+    CLNADDRESS_USERS_FILENAME, PluginState,
+    structs::{UserMetadata, validate_user},
+};
+
+const USER_ADD_FIELDS: &[&str] = &[
+    "user",
+    "is_email",
+    "description",
+    "min_sendable_msat",
+    "max_sendable_msat",
+    "comment_allowed",
+    "nostr_enabled",
+];
 
 pub async fn user_add(
     plugin: Plugin<PluginState>,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    let result;
-    let user;
-    let metadata;
-    let users_clone;
-    {
-        let mut users = plugin.state().users.lock();
-        (user, metadata) = parse_user_add_args(&args)?;
-        result = users.insert(user.clone(), metadata.clone());
-        users_clone = users.clone();
-    }
-    save_users(&plugin.state().plugin_dir, users_clone).await?;
-    let mut mode = if let Some(_res) = result {
+    let (user, metadata) = parse_user_add_args(&args)?;
+    metadata.validate(
+        plugin.state().min_sendable_msat,
+        plugin.state().max_sendable_msat,
+    )?;
+
+    let _update_guard = plugin.state().user_update_lock.lock().await;
+    let (existed, updated_users) = {
+        let users = plugin.state().users.lock();
+        let existed = users.contains_key(&user);
+        let mut updated_users = users.clone();
+        updated_users.insert(user.clone(), metadata.clone());
+        (existed, updated_users)
+    };
+
+    save_users(&plugin.state().plugin_dir, updated_users.clone()).await?;
+    *plugin.state().users.lock() = updated_users;
+
+    let mut mode = if existed {
         json!({"mode":"updated"})
     } else {
         json!({"mode":"added"})
@@ -41,103 +61,122 @@ pub async fn user_add(
 pub fn parse_user_add_args(
     args: &serde_json::Value,
 ) -> Result<(String, UserMetadata), anyhow::Error> {
-    match args {
-        serde_json::Value::String(s) => Ok((
-            s.clone(),
-            UserMetadata {
-                is_email: None,
-                description: None,
-            },
-        )),
-        serde_json::Value::Number(n) => Ok((
-            n.to_string(),
-            UserMetadata {
-                is_email: None,
-                description: None,
-            },
-        )),
-        serde_json::Value::Array(values) => {
-            if values.is_empty() {
-                return Err(anyhow!("Empty array input"));
-            }
+    let (user, metadata) = match args {
+        Value::String(s) => (s.clone(), UserMetadata::default()),
+        Value::Number(n) => (n.to_string(), UserMetadata::default()),
+        Value::Array(values) => parse_legacy_user_array(values)?,
+        Value::Object(map) => parse_user_object(map)?,
+        _ => return Err(anyhow!("Not a valid input type")),
+    };
 
-            let user_val = values.first().ok_or_else(|| anyhow!("Empty array input"))?;
-            let user_string = match user_val {
-                serde_json::Value::Number(number) => number.to_string(),
-                serde_json::Value::String(s) => s.to_owned(),
-                _ => return Err(anyhow!("Array user element has invalid type")),
-            };
+    validate_user(&user)?;
+    Ok((user, metadata))
+}
 
-            let is_email_val = values.get(1);
-            log::debug!("{is_email_val:?}");
-            let is_email = if let Some(val) = is_email_val {
-                match val {
-                    serde_json::Value::Bool(b) => Some(*b),
-                    serde_json::Value::String(s) => Some(s.parse()?),
-                    _ => return Err(anyhow!("`is_email` has invalid type")),
-                }
-            } else {
-                None
-            };
-            let description_val = values.get(2);
-            let description = if let Some(desc) = description_val {
-                match desc {
-                    serde_json::Value::Number(number) => Some(number.to_string()),
-                    serde_json::Value::String(s) => Some(s.to_owned()),
-                    _ => return Err(anyhow!("`description` has invalid type")),
-                }
-            } else {
-                None
-            };
+fn parse_legacy_user_array(values: &[Value]) -> Result<(String, UserMetadata), anyhow::Error> {
+    if values.is_empty() {
+        return Err(anyhow!("Empty array input"));
+    }
+    if values.len() > 3 {
+        bail!(
+            "positional clnaddress-adduser supports only `user [is_email] [description]`; use named parameters for per-address limits, comments, or Nostr settings"
+        );
+    }
 
-            Ok((
-                user_string,
-                UserMetadata {
-                    is_email,
-                    description,
-                },
-            ))
+    let user = value_to_string(&values[0], "user")?;
+    let is_email = values
+        .get(1)
+        .map(|value| value_to_bool(value, "is_email"))
+        .transpose()?;
+    let description = values
+        .get(2)
+        .map(|value| value_to_string(value, "description"))
+        .transpose()?;
+
+    Ok((
+        user,
+        UserMetadata {
+            is_email,
+            description,
+            ..UserMetadata::default()
+        },
+    ))
+}
+
+fn parse_user_object(map: &Map<String, Value>) -> Result<(String, UserMetadata), anyhow::Error> {
+    for key in map.keys() {
+        if !USER_ADD_FIELDS.contains(&key.as_str()) {
+            bail!("unknown clnaddress-adduser field `{key}`");
         }
-        serde_json::Value::Object(map) => {
-            let is_email_val = map.get("is_email");
-            let is_email = if let Some(val) = is_email_val {
-                match val {
-                    serde_json::Value::Bool(b) => Some(*b),
-                    serde_json::Value::String(s) => Some(s.parse()?),
-                    _ => return Err(anyhow!("`is_email` has invalid type")),
-                }
-            } else {
-                None
-            };
-            let description_val = map.get("description");
-            let description = if let Some(desc) = description_val {
-                match desc {
-                    serde_json::Value::Number(number) => Some(number.to_string()),
-                    serde_json::Value::String(s) => Some(s.to_owned()),
-                    _ => return Err(anyhow!("`description` has invalid type")),
-                }
-            } else {
-                None
-            };
+    }
 
-            let user_val = map
-                .get("user")
-                .ok_or_else(|| anyhow!("`user` field not found in object"))?;
-            let user_string = match user_val {
-                serde_json::Value::Number(number) => number.to_string(),
-                serde_json::Value::String(s) => s.to_owned(),
-                _ => return Err(anyhow!("`user` field has invalid type")),
-            };
+    let user = value_to_string(
+        map.get("user")
+            .ok_or_else(|| anyhow!("`user` field not found in object"))?,
+        "user",
+    )?;
 
-            Ok((
-                user_string,
-                UserMetadata {
-                    is_email,
-                    description,
-                },
-            ))
-        }
-        _ => Err(anyhow!("Not a valid input type")),
+    Ok((
+        user,
+        UserMetadata {
+            is_email: optional_bool(map, "is_email")?,
+            description: optional_string(map, "description")?,
+            min_sendable_msat: optional_u64(map, "min_sendable_msat")?,
+            max_sendable_msat: optional_u64(map, "max_sendable_msat")?,
+            comment_allowed: optional_u64(map, "comment_allowed")?,
+            nostr_enabled: optional_bool(map, "nostr_enabled")?,
+        },
+    ))
+}
+
+fn optional_bool(map: &Map<String, Value>, field: &str) -> Result<Option<bool>, anyhow::Error> {
+    map.get(field)
+        .map(|value| value_to_bool(value, field))
+        .transpose()
+}
+
+fn optional_string(
+    map: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<String>, anyhow::Error> {
+    map.get(field)
+        .map(|value| value_to_string(value, field))
+        .transpose()
+}
+
+fn optional_u64(map: &Map<String, Value>, field: &str) -> Result<Option<u64>, anyhow::Error> {
+    map.get(field)
+        .map(|value| value_to_u64(value, field))
+        .transpose()
+}
+
+fn value_to_bool(value: &Value, field: &str) -> Result<bool, anyhow::Error> {
+    match value {
+        Value::Bool(value) => Ok(*value),
+        Value::String(value) => value
+            .parse::<bool>()
+            .map_err(|_| anyhow!("`{field}` must be true or false")),
+        _ => Err(anyhow!("`{field}` has invalid type")),
+    }
+}
+
+fn value_to_string(value: &Value, field: &str) -> Result<String, anyhow::Error> {
+    match value {
+        Value::String(value) => Ok(value.clone()),
+        Value::Number(value) => Ok(value.to_string()),
+        _ => Err(anyhow!("`{field}` has invalid type")),
+    }
+}
+
+fn value_to_u64(value: &Value, field: &str) -> Result<u64, anyhow::Error> {
+    match value {
+        Value::Number(value) => value
+            .as_u64()
+            .ok_or_else(|| anyhow!("`{field}` must be a non-negative integer")),
+        Value::String(value) => value
+            .parse::<u64>()
+            .map_err(|_| anyhow!("`{field}` must be a non-negative integer")),
+        _ => Err(anyhow!("`{field}` has invalid type")),
     }
 }
 
@@ -145,52 +184,32 @@ pub async fn user_del(
     plugin: Plugin<PluginState>,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
-    let result;
-    let user;
-    let users_clone;
-    {
-        let mut users = plugin.state().users.lock();
-        user = match args {
-            serde_json::Value::String(s) => s,
-            serde_json::Value::Array(values) => {
-                let user_val = values.first().ok_or_else(|| anyhow!("Empty array input"))?;
-                match user_val {
-                    serde_json::Value::Number(number) => number.to_string(),
-                    serde_json::Value::String(s) => s.to_owned(),
-                    _ => return Err(anyhow!("Array user element has invalid type")),
-                }
-            }
-            serde_json::Value::Object(map) => {
-                let user_val = map
-                    .get("user")
-                    .ok_or_else(|| anyhow!("`user` field not found in object"))?;
-                match user_val {
-                    serde_json::Value::Number(number) => number.to_string(),
-                    serde_json::Value::String(s) => s.to_owned(),
-                    _ => return Err(anyhow!("`user` field has invalid type")),
-                }
-            }
-            serde_json::Value::Number(n) => n.to_string(),
-            _ => return Err(anyhow!("Not a valid input type")),
-        };
-        result = users.remove(&user);
-        users_clone = users.clone();
-    }
-    if let Some(res) = result {
-        save_users(&plugin.state().plugin_dir, users_clone).await?;
-        let mut mode = json!({"mode":"deleted"});
+    let user = parse_required_user_selector(args)?;
+    let _update_guard = plugin.state().user_update_lock.lock().await;
 
-        mode.as_object_mut()
-            .unwrap()
-            .extend(json!({"user":user}).as_object().unwrap().clone());
-        mode.as_object_mut()
-            .unwrap()
-            .extend(json!(res).as_object().unwrap().clone());
+    let (removed, updated_users) = {
+        let users = plugin.state().users.lock();
+        let removed = users
+            .get(&user)
+            .cloned()
+            .ok_or_else(|| anyhow!("User not found"))?;
+        let mut updated_users = users.clone();
+        updated_users.remove(&user);
+        (removed, updated_users)
+    };
 
-        Ok(mode)
-    } else {
-        Err(anyhow!("User not found"))
-    }
+    save_users(&plugin.state().plugin_dir, updated_users.clone()).await?;
+    *plugin.state().users.lock() = updated_users;
+
+    let mut mode = json!({"mode":"deleted"});
+    mode.as_object_mut()
+        .unwrap()
+        .extend(json!({"user":user}).as_object().unwrap().clone());
+    mode.as_object_mut()
+        .unwrap()
+        .extend(json!(removed).as_object().unwrap().clone());
+
+    Ok(mode)
 }
 
 pub async fn user_list(
@@ -198,57 +217,66 @@ pub async fn user_list(
     args: serde_json::Value,
 ) -> Result<serde_json::Value, anyhow::Error> {
     let mut users = plugin.state().users.lock().clone();
-    let user = match args {
-        serde_json::Value::String(s) => Some(s),
-        serde_json::Value::Array(values) => {
-            if values.is_empty() {
-                None
-            } else {
-                let user_val = values.first().ok_or_else(|| anyhow!("Empty array input"))?;
-                match user_val {
-                    serde_json::Value::Number(number) => Some(number.to_string()),
-                    serde_json::Value::String(s) => Some(s.to_owned()),
-                    _ => return Err(anyhow!("Array user element has invalid type")),
-                }
-            }
-        }
-        serde_json::Value::Object(map) => {
-            let user_val = map
-                .get("user")
-                .ok_or_else(|| anyhow!("`user` field not found in object"))?;
-            match user_val {
-                serde_json::Value::Number(number) => Some(number.to_string()),
-                serde_json::Value::String(s) => Some(s.to_owned()),
-                _ => return Err(anyhow!("`user` field has invalid type")),
-            }
-        }
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        _ => return Err(anyhow!("Not a valid input type")),
-    };
+    let user = parse_optional_user_selector(args)?;
 
-    if let Some(usr) = user {
-        users.retain(|u, _v| u.eq_ignore_ascii_case(&usr));
+    if let Some(user) = user {
+        users.retain(|candidate, _| candidate == &user);
         if users.is_empty() {
-            return Err(anyhow!("User `{usr}` not found!"));
+            return Err(anyhow!("User `{user}` not found!"));
         }
     }
 
     let array: Vec<serde_json::Value> = users
         .into_iter()
         .map(|(key, data)| {
-            let data_value = serde_json::to_value(&data).unwrap_or(serde_json::Value::Null);
-            if let serde_json::Value::Object(mut map) = data_value {
-                map.insert("user".to_string(), serde_json::Value::String(key));
-                serde_json::Value::Object(map)
+            let data_value = serde_json::to_value(&data).unwrap_or(Value::Null);
+            if let Value::Object(mut map) = data_value {
+                map.insert("user".to_string(), Value::String(key));
+                Value::Object(map)
             } else {
-                json!({
-                    "user": key
-                })
+                json!({"user": key})
             }
         })
         .collect();
 
-    Ok(serde_json::Value::Array(array))
+    Ok(Value::Array(array))
+}
+
+fn parse_required_user_selector(args: Value) -> Result<String, anyhow::Error> {
+    parse_optional_user_selector(args)?.ok_or_else(|| anyhow!("user is required"))
+}
+
+fn parse_optional_user_selector(args: Value) -> Result<Option<String>, anyhow::Error> {
+    let user = match args {
+        Value::String(value) => Some(value),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Array(values) => {
+            if values.is_empty() {
+                None
+            } else if values.len() == 1 {
+                Some(value_to_string(&values[0], "user")?)
+            } else {
+                return Err(anyhow!("expected zero or one user argument"));
+            }
+        }
+        Value::Object(map) => {
+            for key in map.keys() {
+                if key != "user" {
+                    bail!("unknown field `{key}`");
+                }
+            }
+            map.get("user")
+                .map(|value| value_to_string(value, "user"))
+                .transpose()?
+        }
+        Value::Null => None,
+        _ => return Err(anyhow!("Not a valid input type")),
+    };
+
+    if let Some(user) = &user {
+        validate_user(user)?;
+    }
+    Ok(user)
 }
 
 pub async fn save_users(
@@ -256,6 +284,59 @@ pub async fn save_users(
     users: HashMap<String, UserMetadata>,
 ) -> Result<(), anyhow::Error> {
     let serialized = serde_json::to_string(&users)?;
-    fs::write(path.join(CLNADDRESS_USERS_FILENAME), serialized).await?;
+    let destination = path.join(CLNADDRESS_USERS_FILENAME);
+    let temporary = path.join(format!(".{CLNADDRESS_USERS_FILENAME}.tmp"));
+    fs::write(&temporary, serialized).await?;
+    fs::rename(&temporary, &destination).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_positional_user_add_remains_compatible() {
+        let (user, metadata) = parse_user_add_args(&json!([
+            "herd",
+            true,
+            "Lightning Goats"
+        ]))
+        .unwrap();
+        assert_eq!(user, "herd");
+        assert_eq!(metadata.is_email, Some(true));
+        assert_eq!(metadata.description.as_deref(), Some("Lightning Goats"));
+        assert_eq!(metadata.comment_allowed, None);
+    }
+
+    #[test]
+    fn named_user_add_parses_rich_settings() {
+        let (user, metadata) = parse_user_add_args(&json!({
+            "user": "herd",
+            "description": "Feed the Lightning Goats",
+            "min_sendable_msat": 1000,
+            "max_sendable_msat": 10_000_000,
+            "comment_allowed": 250,
+            "nostr_enabled": true
+        }))
+        .unwrap();
+        assert_eq!(user, "herd");
+        assert_eq!(metadata.min_sendable_msat, Some(1000));
+        assert_eq!(metadata.max_sendable_msat, Some(10_000_000));
+        assert_eq!(metadata.comment_allowed, Some(250));
+        assert_eq!(metadata.nostr_enabled, Some(true));
+    }
+
+    #[test]
+    fn named_user_add_rejects_unknown_fields_and_noncanonical_users() {
+        assert!(
+            parse_user_add_args(&json!({"user":"herd","comment_allowd":250})).is_err()
+        );
+        assert!(parse_user_add_args(&json!({"user":"Herd"})).is_err());
+    }
+
+    #[test]
+    fn positional_extensions_are_rejected_in_favor_of_named_args() {
+        assert!(parse_user_add_args(&json!(["herd", true, "desc", 1000])).is_err());
+    }
 }
