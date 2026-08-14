@@ -1,23 +1,20 @@
 use std::{
     collections::HashMap,
+    fs,
     net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow, bail};
 use cln_plugin::ConfiguredPlugin;
 use parking_lot::Mutex;
 use url::Url;
 
 use crate::{
-    OPT_CLNADDRESS_BASE_URL,
-    OPT_CLNADDRESS_DESCRIPTION,
-    OPT_CLNADDRESS_LISTEN,
-    OPT_CLNADDRESS_MAX_RECEIVABLE,
-    OPT_CLNADDRESS_MIN_RECEIVABLE,
-    OPT_CLNADDRESS_NOSTR_PRIVKEY,
-    PluginState,
+    OPT_CLNADDRESS_BASE_URL, OPT_CLNADDRESS_DESCRIPTION, OPT_CLNADDRESS_LISTEN,
+    OPT_CLNADDRESS_MAX_RECEIVABLE, OPT_CLNADDRESS_MIN_RECEIVABLE,
+    OPT_CLNADDRESS_NOSTR_PRIVKEY, OPT_CLNADDRESS_NOSTR_PRIVKEY_FILE, PluginState,
 };
 
 pub fn get_startup_options(
@@ -76,11 +73,9 @@ pub fn get_startup_options(
     }
 
     let default_description = plugin.option(&OPT_CLNADDRESS_DESCRIPTION)?;
-
-    let nostr_zapper_keys = match plugin.option(&OPT_CLNADDRESS_NOSTR_PRIVKEY)? {
-        Some(privkey) => Some(nostr::key::Keys::parse(&privkey)?),
-        None => None,
-    };
+    let inline_nostr_privkey = plugin.option(&OPT_CLNADDRESS_NOSTR_PRIVKEY)?;
+    let nostr_privkey_file = plugin.option(&OPT_CLNADDRESS_NOSTR_PRIVKEY_FILE)?;
+    let nostr_zapper_keys = load_nostr_zapper_keys(inline_nostr_privkey, nostr_privkey_file)?;
 
     let plugin_dir = Path::new(&plugin.configuration().lightning_dir).join("clnaddress");
 
@@ -96,4 +91,74 @@ pub fn get_startup_options(
         payindex: 0,
         listen_address,
     })
+}
+
+fn load_nostr_zapper_keys(
+    inline_privkey: Option<String>,
+    privkey_file: Option<String>,
+) -> Result<Option<nostr::key::Keys>, anyhow::Error> {
+    let secret = match (inline_privkey, privkey_file) {
+        (Some(_), Some(_)) => {
+            bail!(
+                "configure only one of `{}` or `{}`",
+                OPT_CLNADDRESS_NOSTR_PRIVKEY.name(),
+                OPT_CLNADDRESS_NOSTR_PRIVKEY_FILE.name()
+            );
+        }
+        (Some(secret), None) => Some(secret),
+        (None, Some(path)) => Some(read_secret_file(Path::new(&path))?),
+        (None, None) => None,
+    };
+
+    secret
+        .map(|secret| {
+            let secret = secret.trim();
+            if secret.is_empty() {
+                bail!("Nostr zap receipt private key is empty");
+            }
+            nostr::key::Keys::parse(secret).context("invalid Nostr zap receipt private key")
+        })
+        .transpose()
+}
+
+fn read_secret_file(path: &Path) -> Result<String, anyhow::Error> {
+    if path.as_os_str().is_empty() {
+        bail!("Nostr private key file path is empty");
+    }
+
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("could not stat Nostr private key file {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("Nostr private key file must not be a symbolic link");
+    }
+    if !metadata.is_file() {
+        bail!("Nostr private key path must reference a regular file");
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "Nostr private key file permissions are too broad ({mode:o}); use mode 0600 or stricter"
+            );
+        }
+    }
+
+    fs::read_to_string(path)
+        .with_context(|| format!("could not read Nostr private key file {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_two_zap_secret_sources() {
+        assert!(
+            load_nostr_zapper_keys(Some("secret".to_owned()), Some("/tmp/key".to_owned()))
+                .is_err()
+        );
+    }
 }
