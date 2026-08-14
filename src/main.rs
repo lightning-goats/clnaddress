@@ -81,10 +81,10 @@ async fn main() -> anyhow::Result<()> {
         .option(OPT_CLNADDRESS_NOSTR_PRIVKEY_FILE)
         .rpcmethod_from_builder(
             RpcMethodBuilder::new("clnaddress-adduser", user_add)
-                .description("Add or update a user with optional LNURL metadata and policy")
-                .usage(
-                    "user [is_email] [description] [min_sendable_msat] [max_sendable_msat] [comment_allowed] [nostr_enabled]",
-                ),
+                .description(
+                    "Add or update a user. Rich per-address settings are accepted as named parameters.",
+                )
+                .usage("user [is_email] [description]"),
         )
         .rpcmethod_from_builder(
             RpcMethodBuilder::new("clnaddress-deluser", user_del)
