@@ -108,7 +108,7 @@ jobs:
             if [ "$X86_MINOS" != "$EXPECTED_TARGET" ] || [ "$ARM64_MINOS" != "$EXPECTED_TARGET" ]; then
               echo "ERROR: Deployment target mismatch!"
               echo "Expected: $EXPECTED_TARGET"
-              echo "Got: x86_64=$X86_MINOS, arm64=$ARM_MINOS"
+              echo "Got: x86_64=$X86_MINOS, arm64=$ARM64_MINOS"
               exit 1
             fi
 
